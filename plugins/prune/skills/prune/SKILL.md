@@ -1,248 +1,258 @@
 ---
 name: prune
 description: >
-  Catalog, verify, and clean up stale git branches. Supports squash-merge
-  workflows. USE THIS SKILL when the user wants to clean up old branches,
-  find stale branches, or tidy their git repo.
+  Review and delete merged or duplicate git branches after explicit per-ref
+  approval. Use when the user wants to clean up branches, find stale branches,
+  or tidy a repo. Do not run `git prune` or `git remote prune`, which discard
+  unreachable objects and stale remote-tracking refs rather than deleting branches.
 ---
 
-# Prune — Interactive Branch Cleanup
+# Prune: Interactive Branch Cleanup
 
-Scan all branches, categorize by status, present for review, and delete approved branches.
+Inventory branch refs, prove which are safe to delete, and delete only what the user
+approves. For rebases, force pushes, and history rewriting, see `git-good`.
 
----
+## Ref invariants
 
-## Phase 1: Detect Repository Layout
+A local branch and its remote counterpart are separate refs that can point at different
+commits. Prove, present, approve, and delete each one independently, and carry the
+fully-qualified refname in every row. Evidence about `refs/heads/<name>` never authorizes
+deleting `refs/remotes/<remote>/<name>`.
 
-Auto-detect the upstream remote and target branch, then confirm with the user.
+Resolve every SHA from the full refname. `git rev-parse feature` reads the local branch
+even when the row describes `origin/feature`, so a short name can prove one ref and delete
+another.
 
-### 1.1 Find the upstream remote
+`\$name` throughout means everything after `refs/heads/` or `refs/remotes/<remote>/`,
+slashes included. For `refs/remotes/origin/users/matt/topic` it is `users/matt/topic`.
+Taking the last segment instead yields `topic`, which names a different branch and deletes
+the wrong ref.
 
-Run `git remote -v` and look for:
-1. A remote named `upstream` — common for fork workflows
-2. If no `upstream`, check if `origin` points to the canonical repo (not a fork)
-3. If ambiguous, ask the user which remote is the upstream source of truth
+Pass ref names as arguments, never by pasting them into a command string. Git accepts
+branch names containing shell metacharacters, so `git update-ref -d refs/heads/$name` is
+safe where the same name spliced into command text is not.
 
-### 1.2 Find the target branch
+## 1. Resolve remotes, target, and scope
 
-Run `git remote show <upstream>` or check for common default branches:
-- `main`, `master`, `dev` (in that order of preference)
-- Or read from `git symbolic-ref refs/remotes/<upstream>/HEAD`
+Read `git remote -v`. Identify the remote holding canonical history and, when it differs,
+the one the user may delete from. In a fork workflow `upstream` is canonical and read-only
+while `origin` is the user's fork.
 
-### 1.3 Confirm with user
+Ask whether remote cleanup is authorized and for which remote. On a shared remote, ask
+whether ownership is defined by branch namespace, such as `users/<name>/`, or by tip author
+email, which is approximate because anyone can author the tip of anyone's branch. State the
+rule when presenting and offer only matching refs. Treat every ref on a personal fork as
+theirs.
 
-Present the detected upstream remote and target branch. Ask the user to confirm or override. Example:
+Stop if the repo is a mirror. Detect it with `git config --get remote.<remote>.mirror` or a
+fetch refspec of `+refs/*:refs/*`. A mirror clone's `git fetch --prune`, which this skill
+runs, deletes `refs/prune/graveyard` and its reflog, so recovery vanishes the moment
+deletion finishes.
 
-> Detected upstream: `upstream` → `akkadotnet/akka.net`, target branch: `dev`
-> Is this correct?
+Confirm `git reflog write` exists before asking for approval, since recovery depends on it:
 
----
+    git reflog write
 
-## Phase 2: Scan Branches
+Resolve the target with `git symbolic-ref refs/remotes/<canonical>/HEAD`. It returns a full
+ref such as `refs/remotes/origin/main`. Keep the full ref for commands. Ask the user when
+the lookup fails.
 
-### 2.1 Fetch latest
+Protect the target's local counterpart too. A target of `refs/remotes/origin/main` leaves
+`refs/heads/main` unprotected, and it satisfies the merged rule whenever another branch is
+checked out.
 
-```
-git fetch <upstream> --quiet
-git fetch origin --prune --quiet
-```
+Ask which branches and patterns are protected beyond those, including long-lived branches
+such as `release/1.x` whose latest synchronization pull request would otherwise satisfy the
+merged rule.
 
-### 2.2 Enumerate all branches
+Fetch only the confirmed remotes, and stop if a fetch fails, since stale refs produce
+categorizations that look like evidence.
 
-Run `git branch -vv --no-color` to get all local branches with:
-- Branch name
-- Short SHA
-- Tracking remote (if any)
-- Ahead/behind status
-- Last commit subject
+    git fetch <remote> --prune
 
-Also run `git branch -r --no-color` to get remote branches on `origin` (excluding upstream branches — those aren't ours).
+## 2. Inventory refs
 
-### 2.3 Collect metadata
+Run `git worktree prune --dry-run --verbose`, then ask before running `git worktree prune`
+on its results. A worktree whose
+directory is gone still holds its branch, so pruning frees it for deletion, but a worktree on
+a disconnected network or removable drive looks identical and its branch should stay
+protected.
 
-For each branch, record:
-- **name**: branch name
-- **sha**: short SHA of the tip commit
-- **tracking**: which remote branch it tracks (if any)
-- **has_local**: whether a local branch exists
-- **has_remote**: whether `origin/<name>` exists
-- **last_commit_subject**: the commit message of the tip
-- **is_current**: whether it's the currently checked-out branch
+    git for-each-ref --format='%(refname)%09%(objectname)%09%(committerdate:short)%09%(authoremail)%09%(subject)' refs/heads refs/remotes
 
-Skip tracking branches (`dev`, `main`, `master`) — never suggest deleting these.
+One row per ref:
 
----
+| Field | Source |
+|---|---|
+| `ref` | fully-qualified `refs/heads/...` or `refs/remotes/...` |
+| `scope` | `local` or the remote name |
+| `sha` | `%(objectname)`, full 40 characters |
+| `subject`, `date` | `%(subject)`, `%(committerdate:short)` |
+| `author` | `%(authoremail)`, used only when ownership is defined by author email |
+| `checked_out` | a `branch <ref>` record in `git worktree list --porcelain` |
+| `protected` | the target ref, its local counterpart, or a ref the user named in phase 1 |
 
-## Phase 3: Categorize Each Branch
+Pair each `worktree <path>` record with the `branch <ref>` record that follows it. A ref
+with such a pairing is worktree-backed, and its row carries the directory as well as the ref.
+Name the directory even when it looks redundant. Directories get reused, so a branch is often
+checked out in one named after a different branch.
 
-For each non-tracking branch, determine its category. Try these checks **in order** - the first match wins.
+A worktree directory can also hold uncommitted changes, untracked files, and ignored files.
+List them in the row before asking approval, grouping build output by directory.
 
-### 3.1 Check: Is it the current branch?
+    git -C $dir status --porcelain --untracked-files=all --ignored
 
-If `is_current` is true, category = **current** (never delete).
+Pass `--untracked-files=all` and plain `--ignored`. The first defeats a repo-local
+`status.showUntrackedFiles=no` and expands ignored directories into their files. Narrowing to
+`--ignored=matching` collapses them again, so an ignore rule on a directory reports one line
+and hides everything under it.
 
-### 3.2 Check: Is it a rename of another branch?
+Under `--untracked-files=all` an ordinary untracked directory expands into its files, so any
+entry still ending in a slash is a nested repository. Check it before offering the row: a clone
+inside a worktree can hold history that exists nowhere else.
 
-Compare the SHA against all other branches. If another branch has the **exact same SHA** and a different name, this is
-likely an old name.
+Keep, and never offer, a worktree-backed ref whose directory is the main worktree, which
+`git worktree list --porcelain` emits first, contains another registered worktree path, is
+missing or `prunable`, is `locked`, or holds an initialized submodule.
+Removing an outer directory deletes a nested worktree and its uncommitted files even when
+ignore rules hide it, and removing a missing path silently unregisters a worktree that is
+merely offline.
 
-Category = **renamed** if:
-- Same SHA as another branch
-- The other branch has a remote tracking branch or an open PR
-- This branch does NOT have a remote tracking branch or open PR
+Split each row on the first four tabs only, since a subject can contain one. Skip
+`refs/remotes/<remote>/HEAD`, a symbolic ref rather than a branch. Bare and detached
+worktrees emit no `branch` record and protect nothing, so match those records rather than
+searching the output for a name, which also matches paths and lock reasons.
 
-Record which branch it was renamed to.
+## 3. Categorize
 
-### 3.3 Check: Is it merged upstream?
+Apply the first rule that matches.
 
-**Step A — Try `git branch --merged`:**
+Keep any protected ref.
 
-```
-git branch --merged <upstream>/<target>
-```
+A worktree-backed ref stays eligible only together with its directory. Categorize it by the
+rules below, and when it comes out merged, offer both in one row.
 
-If the branch appears in this list, it was merged (not squash-merged). Category = **merged**.
+Keep any ref with an open pull request, found with `gh pr list --head <name> --state open`
+or `az repos pr list --source-branch <ref> --status active`. Test this before merge status,
+because a branch whose old pull request merged can carry new work under a new one, and
+testing merge first classifies it as merged and deletes that work.
 
-**Step B — Try PR-based verification (for squash merges):**
+Treat a ref as merged when its tip is already an ancestor of the target, which covers merge
+commits and fast-forwards and needs no API:
 
-If the branch was NOT in the `--merged` list, check if it has a merged PR.
+    git merge-base --is-ancestor <ref> <target-ref>
 
-Use available tools to search for PRs from the branch. Try these in order:
-- **GitHub MCP tools** — search for PRs with the branch name as head ref
-- **Azure DevOps MCP tools** — search for PRs with the branch as source ref
-- **`gh` CLI** — `gh pr list --head <branch-name> --state merged --json number`
-- **`az` CLI** — `az repos pr list --source-branch <branch-name> --status completed`
-- If none are available, skip PR-based verification (see Error Handling)
+Otherwise a squash or rebase merge counts only when all three hold: the pull request is
+merged or completed, its head commit equals the ref's current SHA, and its merge commit is
+an ancestor of the target.
 
-If a merged PR is found, verify the squash commit exists on the target branch:
+| Value | GitHub (`gh pr view --json`) | Azure DevOps (`az repos pr show`) |
+|---|---|---|
+| head commit | `headRefOid` | `lastMergeSourceCommit.commitId` |
+| merge commit | `mergeCommit.oid` | `lastMergeCommit.commitId` |
 
-```
-git log --oneline <upstream>/<target> --grep="#<pr-number>" -1
-```
+Read both from the pull request API rather than from commit messages, which do not reliably
+carry either.
 
-If found, category = **merged**. Record the PR number.
+Report equal tip SHAs as a shared tip and infer no rename, since duplicates and abandoned
+experiments produce them too. Leave the decision to the user, and keep a shared tip that no
+merge rule reached: sharing a tip with another ref is not evidence that either is merged.
 
-**Step C — No merged PR found:**
+Everything else is unknown. Show the subject and date so the user can judge.
 
-Continue to next check.
+## 4. Present
 
-### 3.4 Check: Does it have an open PR?
+One row per ref, grouped by category, deletable rows first:
 
-Search for open PRs from this branch using available tools (GitHub MCP, Azure DevOps MCP, `gh` CLI, or `az` CLI - same
-priority as step 3.3B).
+| Ref | Scope | Proof | Tip | Last commit |
+|---|---|---|---|---|
+| `refs/heads/feature/login` | local | PR #142 merged, head matches | `a1b2c3...` | 2026-07-14 Add login |
+| `refs/remotes/origin/feature/login` | origin | tip is ancestor of target | `a1b2c3...` | 2026-07-14 Add login |
+| `refs/heads/feature/api` | local + worktree `D:\wt\api` | PR #150 merged, head matches | `d4e5f6...` | 2026-07-20 Add API |
 
-If found, category = **active_pr**. Record the PR number.
 
-### 3.5 Fallback: Unknown
 
-If none of the above matched, category = **unknown**.
+Follow with the unknown rows, then a one-line-per-ref summary of what stays.
 
----
+## 5. Approve and delete
 
-## Phase 4: Present for Review
+Number the deletable refs and ask for the numbers to delete. Accept a comma-separated
+list, or `all` once the user has seen the numbered list. Reprint and ask again if the
+inventory changed after they read it, and give the retention warning from Recovery before
+asking. For a worktree-backed row, say separately that approval destroys the directory: the
+graveyard recovers the branch tip and nothing on disk, so uncommitted files, ignored files
+such as local `.env`, and any untracked work are gone for good.
 
-Group branches by action and present using a card-per-branch format.
+Approval covers one ref at one SHA. Delete only the operation its scope names: approving
+`refs/remotes/origin/topic` authorizes the remote deletion alone and never touches local
+`topic`, which may hold different commits.
 
-### Output format
+Initialize the graveyard once before the loop:
 
-```
-DELETE (<count> branches)
-═════════════════════════
+    git update-ref --create-reflog -m "prune: init" refs/prune/graveyard <target-sha>
 
-  Merged PRs (local + origin)
-  ───────────────────────────
+For each approved ref, append a recovery entry without moving the ref, and abort that ref if
+the append fails. `git reflog write` does not require `old-oid` to match anything, so the
+graveyard is a journal of deleted tips rather than a history of real transitions:
 
-  ✓ <branch-name>
-    PR #<number> merged │ <sha>
-    ├─ delete: git branch -D <branch-name>
-    ├─ delete: git push origin --delete <branch-name>
-    └─ undo:   git branch <branch-name> <full-sha>
+    git reflog write refs/prune/graveyard <target-sha> $approvedSha "prune: $ref"
 
-  Renamed (old names)
-  ───────────────────
+For a worktree-backed row, confirm the ref still resolves to its approved SHA before touching
+the filesystem. Directory removal is irreversible and the ref check is not, so run the cheap
+check first:
 
-  → <old-branch-name>
-    Renamed to <new-branch-name> │ <sha>
-    ├─ delete: git branch -D <old-branch-name>
-    └─ undo:   git branch <old-branch-name> <full-sha>
+    git rev-parse refs/heads/$name    # must equal $approvedSha, else skip the row
 
+Before removal, ask which of the row's listed files to preserve and where to put them. Copy
+those outside every worktree being deleted and verify the copies. Immediately before removing,
+re-run the inventory and skip a changed row. Git removes a worktree containing only ignored
+files without refusing, and a file written after approval was never presented to the user.
 
-UNKNOWN (<count> branches — need your input)
-════════════════════════════════════════════
+Remove the directory with `--force`. A working directory is normally dirty, and plain
+`git worktree remove` refuses on modified or untracked files:
 
-  ? <branch-name>
-    No PR found │ local only │ <sha>
-    Last commit: "<commit subject>"
+    git worktree remove --force $worktreePath
 
+Treat a failed removal as damage, not as a clean refusal. Git does not refuse cleanly when a
+file cannot be deleted, for example one held open on Windows: it removes what it can, including
+tracked files, `.git`, and the registration, then fails. Stop the run and report rather than
+continuing to the ref delete, because the branch-record check will now pass on a half-destroyed
+worktree.
 
-KEEPING (<count> branches)
-══════════════════════════
+For a local row, confirm no `branch` record in `git worktree list --porcelain` names the
+ref, then delete with the expected old SHA, which refuses a ref that moved after
+presentation:
 
-  ● <branch-name>    PR #<number> open
-  ─ dev
-  ─ master
-```
+    git update-ref -d refs/heads/$name $approvedSha
 
-### Presentation rules
+The check and the delete are not atomic, so a worktree appearing between them still loses its
+branch. Prefer the expected SHA: the graveyard recovers that branch, but not commits pushed
+after presentation.
 
-1. **DELETE section first** — this is what the user is here for
-2. **Group within DELETE** by sub-category: merged PRs, abandoned, renamed
-3. **For each deletable branch** show:
-   - Status icon: ✓ (merged), ✗ (abandoned), → (renamed)
-   - Why it's safe to delete (PR number, rename target)
-   - Exact delete commands (local + remote if applicable)
-   - Exact undo command (git branch from SHA)
-4. **UNKNOWN section** — branches where the skill couldn't determine status. Show the last commit subject to help the
-   user decide.
-5. **KEEPING section** — brief, one line per branch. Just so the user can verify nothing was miscategorized.
-6. **Use `-D` (force)** for delete commands, not `-d`, because squash-merged branches won't be detected as merged by git.
+For a remote row, lease and delete the remote's `refs/heads/<name>`, not the
+`refs/remotes/...` name the inventory carries:
 
----
+    git push $remote "--force-with-lease=refs/heads/${name}:$approvedSha" --delete "refs/heads/$name"
 
-## Phase 5: Confirm and Execute
+Report every result. After a failed remote deletion, continue and include the error. Finish
+with `git fetch <remote> --prune` and report how many refs remain.
 
-### 5.1 Ask for approval
+## Recovery
 
-After presenting the view, ask the user which branches to delete:
-- "Delete all in the DELETE section?"
-- "Delete all + some/all unknowns?"
-- "Let me pick individually"
+The graveyard reflog retains each deleted tip for `gc.reflogExpireUnreachable`, 30 days by
+default and not guaranteed. Recover one with `git branch <name> <sha>`, reading the SHA and
+its original refname from `git reflog show refs/prune/graveyard`. The ref sits outside
+`refs/heads`, so it never appears in `git branch`.
 
-### 5.2 Execute deletions
+For unmerged work the user wants to keep longer, offer a bundle or a tag.
 
-For approved branches:
+## Error handling
 
-1. Switch to a safe branch first if the current branch is being deleted (switch to the target branch, e.g., `dev`)
-2. Delete local branches: `git branch -D <name>`
-3. Delete remote branches: `git push origin --delete <name>`
-4. Report each deletion result (success/failure)
+Every pull request query must exit successfully and return a complete, parseable result.
+Treat a failed, unauthenticated, rate-limited, or truncated query as unknown. A failed
+query and an empty result are not the same, and confusing them deletes branches with open
+work.
 
-### 5.3 Post-cleanup
-
-Run `git fetch origin --prune` to clean up stale remote tracking refs.
-
-Report final state: how many branches remain.
-
----
-
-## Error Handling
-
-- **PR tools unavailable**: If no GitHub MCP, Azure DevOps MCP, `gh` CLI, or `az` CLI is available, skip PR-based
-  verification. Categorize all non-`--merged` branches as **unknown** and note that PR status couldn't be checked.
-- **Remote deletion fails**: Report the error but continue with remaining deletions. The branch may have already been
-  deleted (e.g., by GitHub's auto-delete on merge).
-- **Current branch in delete list**: Switch to target branch first. If the switch fails, skip that branch and report the
-  error.
-
----
-
-## Quick Reference
-
-```
-/prune
-  1. Detect repo layout  →  find upstream remote + target branch
-  2. Scan branches       →  enumerate local + remote, collect metadata
-  3. Categorize          →  merged / renamed / active PR / unknown
-  4. Present             →  card-per-branch grouped by action
-  5. Confirm + execute   →  user approves, delete local + remote
-```
+Without `gh`, `az`, or an equivalent API, ancestry still identifies direct merges. Squash
+and rebase merges cannot be established, so categorize those refs as unknown and say why
+rather than inferring merge status from names or dates.
