@@ -7,8 +7,8 @@ measure-twice: an agentStop review gate for Copilot CLI.
 With a control flag, reads or writes configuration: -enable / -disable flip the
 current session, -setdefault sets the on/off default for new sessions, -setprompt
 sets the review prompt, and -status reports the session mode, its default, and the prompt. With no flag, reads a hook
-payload on stdin and runs the review gate: when this session is on, it blocks the
-agent from finishing until it runs its reviews and echoes a one-time token.
+payload on stdin. The userPromptSubmitted hook records when the Measure Twice
+prompt wins hook arbitration; agentStop emits at most one outstanding review request.
 
 The gate logic lives in MeasureTwice.psm1; this script is the entry point.
 #>
@@ -35,6 +35,15 @@ if ($enable -or $disable) {
         exit 1
     }
     $mode = if ($enable) { 'on' } else { 'off' }
+    if ($enable) {
+        $statePath = Get-MTGateStatePath -SessionDir $sessionDir
+        try {
+            Invoke-WithMTGateLock -StatePath $statePath -Action { Clear-MTGateState -StatePath $statePath } | Out-Null
+        } catch {
+            Write-Warning "measure-twice: could not reset gate state: $($_.Exception.Message)"
+            exit 1
+        }
+    }
     try { Set-MTSessionMode -SessionDir $sessionDir -Mode $mode } catch { Write-Warning "measure-twice: could not save session mode: $($_.Exception.Message)"; exit 1 }
     "measure-twice: this session is now $mode (default for new sessions stays $($config.defaultMode))"
     exit 0
@@ -58,17 +67,62 @@ if ($status) {
     exit 0
 }
 
-# --- hook mode: gate only when this session is on ---
+# --- hook mode ---
 $inputJson = [Console]::In.ReadToEnd()
 if (-not $inputJson) { exit 0 }
 try { $hook = $inputJson | ConvertFrom-Json } catch { exit 0 }
 
-$transcript = $hook.transcriptPath
-if (-not $transcript) { exit 0 }              # no transcript: can't read the release token, so don't gate
-$sessionDir = Split-Path $transcript -Parent
-if ((Get-MTSessionMode -SessionDir $sessionDir -DefaultMode $config.defaultMode) -ne 'on') { exit 0 }
+$sessionId = [string]$hook.sessionId
+if ($sessionId -notmatch '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') { exit 0 }
 
-$statePath = Get-MTStatePath -SessionDir $sessionDir
-$reason = Invoke-MTGate -Config $config -TranscriptPath $transcript -StatePath $statePath
+if ($hook.PSObject.Properties['source']) {
+    $sessionDir = Get-MTSessionDir -SessionId $sessionId
+    if ($sessionDir) {
+        $statePath = Get-MTGateStatePath -SessionDir $sessionDir
+        try {
+            Invoke-WithMTGateLock -StatePath $statePath -Action {
+                Clear-MTGateState -StatePath $statePath
+                Register-MTReviewPromptDelivery -Prompt ([string]$hook.initialPrompt) -StatePath $statePath
+            } | Out-Null
+        } catch {
+            Write-Warning "measure-twice: could not reset gate state: $($_.Exception.Message)"
+        }
+    }
+    exit 0
+}
+
+if ($hook.PSObject.Properties['prompt']) {
+    $sessionDir = Get-MTSessionDir -SessionId $sessionId
+    if (-not $sessionDir) { exit 0 }
+    if (-not (Test-Path (Join-Path $sessionDir 'workspace.yaml'))) { exit 0 }
+    $statePath = Get-MTGateStatePath -SessionDir $sessionDir
+    if ((Get-MTSessionMode -SessionDir $sessionDir -DefaultMode $config.defaultMode) -ne 'on') { exit 0 }
+    try {
+        Invoke-WithMTGateLock -StatePath $statePath -Action {
+            Register-MTReviewPromptDelivery -Prompt ([string]$hook.prompt) -StatePath $statePath
+        } | Out-Null
+    } catch {
+        Write-Warning "measure-twice: could not record delivered review prompt: $($_.Exception.Message)"
+    }
+    exit 0
+}
+
+if (-not $hook.PSObject.Properties['stopReason']) { exit 0 }
+if (-not (Test-MTMainAgentStop -SessionId $sessionId -TranscriptPath ([string]$hook.transcriptPath))) { exit 0 }
+if (-not $hook.PSObject.Properties['stop_hook_active']) {
+    Write-Warning 'measure-twice: this Copilot CLI version does not report stop_hook_active; update to 1.0.72 or later'
+    exit 0
+}
+$sessionDir = Split-Path ([string]$hook.transcriptPath) -Parent
+$statePath = Get-MTGateStatePath -SessionDir $sessionDir
+if ((Get-MTSessionMode -SessionDir $sessionDir -DefaultMode $config.defaultMode) -ne 'on') { exit 0 }
+try {
+    $reason = Invoke-WithMTGateLock -StatePath $statePath -Action {
+        Invoke-MTGate -Config $config -StopHookActive ([bool]$hook.stop_hook_active) -StatePath $statePath
+    }
+} catch {
+    Write-Warning "measure-twice: could not update gate state: $($_.Exception.Message)"
+    exit 0
+}
 if ($reason) { [PSCustomObject]@{ decision = 'block'; reason = $reason } | ConvertTo-Json -Compress }
 exit 0

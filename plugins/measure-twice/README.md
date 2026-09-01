@@ -1,11 +1,8 @@
 # measure-twice
 
-Measure twice, cut once. A review gate that makes your agent stop and run your review agents before it finishes a
-turn.
+Measure twice, cut once. A configurable end-of-turn review gate for Copilot CLI.
 
-Instructions ask the agent to review its own work, and the agent forgets. **measure-twice** makes the check
-non-skippable: when the agent tries to end a turn, the gate blocks it and hands back a one-time token. The agent
-only gets the token by reading the block, so it cannot finish without at least being asked to review.
+Instructions can ask the agent to review its own work, but the agent can forget.
 
 ## Installation
 
@@ -21,8 +18,7 @@ Hooks load when the CLI starts, so restart your session after installing.
 On or off is per session. Enabling or disabling flips only the current session; setting the default changes what
 new sessions start from. Both go through `/measure-twice`:
 
-- **This session**: enable or disable. The choice lives in the session folder, so it never leaks to other sessions
-  or to your dotfiles.
+- **This session**: enable or disable.
 - **Default for new sessions**: set the default, or manage it in `config.json` (below). It ships as `on`, so an
   installed gate works immediately.
 
@@ -47,23 +43,26 @@ is safe to symlink from dotfiles. Each session's own on/off and gate state live 
 
 ## How it works
 
-`scripts/gate.ps1` is registered on the Copilot CLI `agentStop` event. When the gate is
-active and the agent tries to finish:
+`scripts/gate.ps1` is registered on the Copilot CLI `sessionStart`, `agentStop`, and `userPromptSubmitted` events.
+When the gate is active and the agent tries to finish:
 
-1. The gate generates a random token, splits it with a space, and blocks the turn with your review prompt plus an
-   instruction to echo the token with the space removed.
-2. The agent runs its reviews, addresses findings, and outputs the joined token.
-3. The gate sees the token in the agent's message, clears its state, and lets the turn finish.
+1. `agentStop` blocks with your review prompt and a Measure Twice sentinel when no request is already outstanding
+   and no other stop-hook continuation is active.
+2. Copilot chooses one blocking hook response and submits it as the continuation prompt.
+3. `userPromptSubmitted` marks the gate delivered when the submitted prompt contains the Measure Twice sentinel.
+4. The next stop consumes that delivery. Stops while a request remains pending do not enqueue another one.
+5. Starting a session or explicitly enabling the gate clears stale pending state.
 
-Splitting the token is what makes the check real: the joined form never appears in the prompt, so echoing it proves
-the agent read the block. A fresh token each turn and a block cap keep a stuck agent from looping.
+Measure Twice gates only the main agent. Reviewer and other subagent stops do not create additional review
+continuations.
 
 ## Requirements
 
 - PowerShell (the gate is a PowerShell script; Windows PowerShell 5.1 or PowerShell 7+)
-- Copilot CLI
+- Copilot CLI 1.0.72 or later
 
 ## Limits
 
-A determined agent can echo the token without reviewing: the gate defends against forgetting, not evasion. Pair it
-with a measurement loop if you need to catch an agent that games it.
+The gate defends against forgetting, not deliberate evasion. A later blocking hook can prevent the review prompt
+from being delivered. Measure Twice leaves that request pending instead of retrying and filling the prompt queue;
+restart the session or explicitly enable the gate to rearm it.

@@ -1,7 +1,7 @@
 {
   "name": "measure-twice",
-  "version": "1.0.0",
-  "description": "A review gate that blocks the agent from finishing a turn until it runs your review agents. Measure twice, cut once.",
+  "version": "2.0.2",
+  "description": "A configurable end-of-turn review gate for Copilot CLI.",
   "author": {
     "name": "Matt Kotsenas",
     "url": "https://github.com/MattKotsenas"

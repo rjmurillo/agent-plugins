@@ -1,6 +1,20 @@
 {
   "version": 1,
   "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "powershell": "& \"${CLAUDE_PLUGIN_ROOT}/scripts/gate.ps1\"",
+        "timeoutSec": 30
+      }
+    ],
+    "userPromptSubmitted": [
+      {
+        "type": "command",
+        "powershell": "& \"${CLAUDE_PLUGIN_ROOT}/scripts/gate.ps1\"",
+        "timeoutSec": 30
+      }
+    ],
     "agentStop": [
       {
         "type": "command",

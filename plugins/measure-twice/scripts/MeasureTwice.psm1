@@ -2,10 +2,11 @@
 <#
 Gate logic for measure-twice, in small functions each easy to test on its own.
 The home config lives under <COPILOT_HOME>/measure-twice; each session's on/off
-and per-turn gate state live in that session's own folder.
+and gate state live in that session's own folder.
 #>
 
 $script:DefaultPrompt = 'A review gate is active. If this turn produced anything you are presenting to the user - code, a document, a PR description, a review comment - run your review agents now and address any Critical or High findings before finishing. If this turn was pure investigation with nothing to hand over, just proceed.'
+$script:ReviewPromptSentinel = '<!-- measure-twice:review-request -->'
 
 function Get-MTCopilotHome {
     if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $env:USERPROFILE '.copilot' }
@@ -16,14 +17,22 @@ function Get-MTConfigPath {
 }
 
 function Get-MTSessionDir {
-    # Control commands have no hook payload, so they locate the session folder via
-    # COPILOT_AGENT_SESSION_ID. Returns $null when it is unset; the caller must
-    # then refuse rather than change global behavior. Hook mode uses the transcript
-    # path directly, so it never needs this fallback.
-    if ($env:COPILOT_AGENT_SESSION_ID) {
-        return Join-Path (Join-Path (Get-MTCopilotHome) 'session-state') $env:COPILOT_AGENT_SESSION_ID
+    # Control commands use COPILOT_AGENT_SESSION_ID; hooks supply their session ID.
+    # Returns $null when neither is available so callers never change global state.
+    param([string]$SessionId = $env:COPILOT_AGENT_SESSION_ID)
+    if ($SessionId) {
+        return Join-Path (Join-Path (Get-MTCopilotHome) 'session-state') $SessionId
     }
     $null
+}
+
+function Test-MTMainAgentStop {
+    param([string]$SessionId, [string]$TranscriptPath)
+    if (-not ($SessionId -and $TranscriptPath)) { return $false }
+    $transcriptSessionDir = Split-Path $TranscriptPath -Parent
+    if (-not $transcriptSessionDir) { return $false }
+    $transcriptSessionId = Split-Path $transcriptSessionDir -Leaf
+    $SessionId.Equals($transcriptSessionId, [StringComparison]::OrdinalIgnoreCase)
 }
 
 function Get-MTConfig {
@@ -75,60 +84,89 @@ function Set-MTSessionMode {
     [PSCustomObject]@{ mode = $Mode } | ConvertTo-Json | Set-Content -Path (Join-Path $SessionDir 'measure-twice-mode.json') -Encoding UTF8 -ErrorAction Stop
 }
 
-function Get-MTStatePath {
+function Get-MTGateStatePath {
     param([string]$SessionDir)
-    Join-Path $SessionDir 'measure-twice-state.json'
+    Join-Path $SessionDir 'measure-twice-gate-state.json'
 }
 
-function Get-MTLastAssistantMessage {
-    param([string]$TranscriptPath)
-    if (-not ($TranscriptPath -and (Test-Path $TranscriptPath))) { return '' }
-    $lines = Get-Content $TranscriptPath
-    for ($i = $lines.Length - 1; $i -ge 0; $i--) {
-        if ($lines[$i] -notmatch 'assistant\.message') { continue }
-        try { $evt = $lines[$i] | ConvertFrom-Json } catch { continue }
-        if ($evt.type -eq 'assistant.message') { return [string]$evt.data.content }
+function Set-MTReviewPromptState {
+    param(
+        [ValidateSet('pending', 'delivered')][string]$State,
+        [string]$StatePath
+    )
+    New-Item -ItemType Directory -Force -Path (Split-Path $StatePath -Parent) -ErrorAction Stop | Out-Null
+    [PSCustomObject]@{ state = $State } |
+        ConvertTo-Json |
+        Set-Content -Path $StatePath -Encoding UTF8 -ErrorAction Stop
+}
+
+function Register-MTReviewPromptDelivery {
+    param([string]$Prompt, [string]$StatePath)
+    if (-not ($Prompt -and $Prompt.Contains($script:ReviewPromptSentinel))) { return }
+    Set-MTReviewPromptState -State delivered -StatePath $StatePath
+}
+
+function Get-MTReviewPromptState {
+    param([string]$StatePath)
+    if (-not (Test-Path $StatePath)) { return $null }
+    $json = Get-Content $StatePath -Raw -ErrorAction Stop
+    if ($json.TrimStart().StartsWith('[')) { throw "Invalid Measure Twice gate state at $StatePath" }
+    $state = $json | ConvertFrom-Json -ErrorAction Stop
+    if ($state -is [PSCustomObject] -and
+        $state.state -is [string] -and
+        @('pending', 'delivered') -ccontains $state.state) {
+        return [string]$state.state
     }
-    ''
+    throw "Invalid Measure Twice gate state at $StatePath"
+}
+
+function Clear-MTGateState {
+    param([string]$StatePath)
+    if (Test-Path $StatePath) { Remove-Item $StatePath -Force -ErrorAction Stop }
+}
+
+function Invoke-WithMTGateLock {
+    param(
+        [string]$StatePath,
+        [scriptblock]$Action,
+        [int]$TimeoutMilliseconds = 5000
+    )
+
+    New-Item -ItemType Directory -Force -Path (Split-Path $StatePath -Parent) -ErrorAction Stop | Out-Null
+    $lockPath = "$StatePath.lock"
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    $stream = $null
+    while (-not $stream) {
+        try {
+            $stream = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        } catch [IO.IOException] {
+            if ([DateTime]::UtcNow -ge $deadline) { throw }
+            Start-Sleep -Milliseconds 50
+        }
+    }
+
+    try { & $Action } finally { $stream.Dispose() }
 }
 
 function Invoke-MTGate {
     <#
-    The state machine. Returns a block-reason string to block the stop, or $null
-    to let the turn finish. A random per-turn token guards against loops; a block
-    cap is the safety valve.
+    Emits at most one block while a review prompt is outstanding. A submitted
+    sentinel authorizes one stop, regardless of stop_hook_active.
     #>
-    param($Config, [string]$TranscriptPath, [string]$StatePath, [int]$MaxBlocks = 3)
+    param($Config, [bool]$StopHookActive, [string]$StatePath)
 
-    $assistantText = Get-MTLastAssistantMessage -TranscriptPath $TranscriptPath
-
-    $nonce = ''
-    $count = 0
-    if (Test-Path $StatePath) {
-        try { $state = Get-Content $StatePath -Raw | ConvertFrom-Json } catch { $state = $null }
-        if ($state -and ([string]$state.nonce -match '^MT\d{7}$')) {
-            $nonce = [string]$state.nonce
-            $count = [int]$state.count
+    $reason = "$($Config.prompt)`n`n$script:ReviewPromptSentinel"
+    switch (Get-MTReviewPromptState -StatePath $StatePath) {
+        'delivered' {
+            Clear-MTGateState -StatePath $StatePath
+            return $null
         }
+        'pending' { return $null }
     }
 
-    if ($nonce) {
-        if ($assistantText -match [regex]::Escape($nonce)) { Remove-Item $StatePath -Force; return $null }  # uttered: reviewed
-        if ($count -ge $MaxBlocks)                          { Remove-Item $StatePath -Force; return $null }  # safety valve
-        $count++
-    } else {
-        $nonce = 'MT' + (Get-Random -Minimum 1000000 -Maximum 9999999)
-        $count = 1
-    }
-
-    New-Item -ItemType Directory -Force -Path (Split-Path $StatePath -Parent) | Out-Null
-    [PSCustomObject]@{ nonce = $nonce; count = $count } | ConvertTo-Json | Set-Content -Path $StatePath -Encoding UTF8
-
-    # Split the token with a space so the prompt never contains it verbatim; the
-    # agent must rejoin it to satisfy the gate.
-    $mid = [Math]::Floor($nonce.Length / 2)
-    $split = $nonce.Substring(0, $mid) + ' ' + $nonce.Substring($mid)
-    "$($Config.prompt)`n`nTo release the gate, make this token the last line of your reply, with the internal space removed: $split"
+    if ($StopHookActive) { return $null }
+    Set-MTReviewPromptState -State pending -StatePath $StatePath
+    $reason
 }
 
-Export-ModuleMember -Function Get-MTCopilotHome, Get-MTConfigPath, Get-MTSessionDir, Get-MTConfig, Save-MTConfig, Get-MTSessionMode, Set-MTSessionMode, Get-MTStatePath, Get-MTLastAssistantMessage, Invoke-MTGate
+Export-ModuleMember -Function Get-MTCopilotHome, Get-MTConfigPath, Get-MTSessionDir, Test-MTMainAgentStop, Get-MTConfig, Save-MTConfig, Get-MTSessionMode, Set-MTSessionMode, Get-MTGateStatePath, Register-MTReviewPromptDelivery, Clear-MTGateState, Invoke-WithMTGateLock, Invoke-MTGate
