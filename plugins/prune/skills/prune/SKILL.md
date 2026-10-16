@@ -1,7 +1,7 @@
 ---
 name: prune
 description: >
-  Review and delete merged or duplicate git branches after explicit per-ref
+  Review and delete merged, superseded, or abandoned git branches after explicit per-ref
   approval. Use when the user wants to clean up branches, find stale branches,
   or tidy a repo. Do not run `git prune` or `git remote prune`, which discard
   unreachable objects and stale remote-tracking refs rather than deleting branches.
@@ -9,8 +9,8 @@ description: >
 
 # Prune: Interactive Branch Cleanup
 
-Inventory branch refs, prove which are safe to delete, and delete only what the user
-approves. For rebases, force pushes, and history rewriting, see `git-good`.
+Inventory branch refs, assess what work remains, and delete only what the user approves.
+For rebases, force pushes, and history rewriting, see `git-good`.
 
 ## Ref invariants
 
@@ -33,6 +33,14 @@ branch names containing shell metacharacters, so `git update-ref -d refs/heads/$
 safe where the same name spliced into command text is not.
 
 ## 1. Resolve remotes, target, and scope
+
+Use the user's requested review mode, or offer these modes with the initial scope questions:
+
+- **Merged-only (default):** offer refs with the exact merge proof in phase 3.
+- **Semantic:** also investigate superseded implementations, redundant stacks, and abandoned
+  prototypes. Apply the user's discard policy; clarify only what it leaves ambiguous.
+
+Apply the protection, file-preservation, recovery, and per-ref approval rules in both modes.
 
 Read `git remote -v`. Identify the remote holding canonical history and, when it differs,
 the one the user may delete from. In a fork workflow `upstream` is canonical and read-only
@@ -130,7 +138,7 @@ Apply the first rule that matches.
 Keep any protected ref.
 
 A worktree-backed ref stays eligible only together with its directory. Categorize it by the
-rules below, and when it comes out merged, offer both in one row.
+rules below, and when offering deletion, offer both in one row.
 
 Keep any ref with an open pull request, found with `gh pr list --head <name> --state open`
 or `az repos pr list --source-branch <ref> --status active`. Test this before merge status,
@@ -154,11 +162,25 @@ an ancestor of the target.
 Read both from the pull request API rather than from commit messages, which do not reliably
 carry either.
 
-Report equal tip SHAs as a shared tip and infer no rename, since duplicates and abandoned
-experiments produce them too. Leave the decision to the user, and keep a shared tip that no
-merge rule reached: sharing a tip with another ref is not evidence that either is merged.
+Label equal tip SHAs as shared tips. Establish any rename separately. In merged-only mode,
+keep refs that lack the merge proof above and label them unknown.
 
-Everything else is unknown. Show the subject and date so the user can judge.
+### Semantic review
+
+For each remaining ref, identify work absent from the current target. Include the whole
+branch diff, later commits, and uncommitted work in its worktree. Use `git cherry` or patch
+IDs to locate related changes, then verify their effect through current code, tests, PR
+discussions, and replacement PRs.
+
+Recommend deletion as **superseded** when the intended work landed in another form or is
+fully contained in a retained stack. Cite the landed implementation or retained ref and
+record any remaining behavioral differences. For unmerged stacks, name the copy to retain.
+Classify prototypes and alternate implementations as **abandoned** under the user's
+confirmed discard policy. Reserve **merged** for refs with the exact proof above.
+
+Keep refs with genuinely unique remaining work and explain what the target lacks. Label
+unresolved cases **unknown** and name the missing check. Complete the semantic assessment
+before presenting deletion recommendations.
 
 ## 4. Present
 
@@ -172,7 +194,9 @@ One row per ref, grouped by category, deletable rows first:
 
 
 
-Follow with the unknown rows, then a one-line-per-ref summary of what stays.
+In semantic mode, distinguish merged, superseded, and abandoned candidates and include each
+candidate's evidence and remaining differences. Follow with the unknown rows, then a
+one-line-per-ref summary of what stays and the unique work or protection that keeps it.
 
 ## 5. Approve and delete
 
